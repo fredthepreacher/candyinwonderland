@@ -24,6 +24,9 @@ export default defineConfig({
   server: {
     port: 5179,
     strictPort: true,
-    host: "localhost",
+    // Bind every interface, not just localhost, so the dev server prints a
+    // Network URL you can open on a phone on the same wi-fi. Testing the touch
+    // controls and the lighting on a real handset is the whole point.
+    host: true,
   },
 });
