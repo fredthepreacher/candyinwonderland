@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { GameEngine } from '../game/GameEngine';
-import { PixiGlow }   from '../game/PixiGlow';
+import type { PixiGlow } from '../game/PixiGlow';
 import { AudioManager } from '../game/AudioManager';
 import type { GameCallbacks } from '../game/GameEngine';
 import type { LevelData } from '../game/types';
@@ -37,18 +37,25 @@ export function GameCanvas({ level, audio, callbacks, engineRef }: GameCanvasPro
     `;
     perf.appendChild(canvas);
 
-    // ── PixiJS — WebGL glow / atmosphere overlay ────────────────────────
-    let pixi: PixiGlow | null = null;
-    try {
-      pixi = new PixiGlow(perf, W, H);
-    } catch (e) {
-      console.warn('[PixiGlow] WebGL unavailable, running without glow layer:', e);
-    }
-
     // ── Game engine ─────────────────────────────────────────────────────
     const engine = new GameEngine(canvas, audio, callbacks);
-    if (pixi) engine.setPixiGlow(pixi);
     engineRef.current = engine;
+
+    // ── PixiJS — WebGL glow / atmosphere overlay ────────────────────────
+    // Loaded on demand rather than bundled into the entry chunk: pixi.js is by
+    // far the heaviest dependency here and the glow layer is pure atmosphere.
+    // The engine already renders a full Canvas-2D fallback while pixiGlow is
+    // null, so the game is playable immediately and upgrades itself once the
+    // chunk lands. setPixiGlow re-runs setupLevel, so attaching late is safe.
+    let pixi: PixiGlow | null = null;
+    let disposed = false;
+    import('../game/PixiGlow')
+      .then(({ PixiGlow }) => {
+        if (disposed) return;
+        pixi = new PixiGlow(perf, W, H);
+        engine.setPixiGlow(pixi);
+      })
+      .catch(e => console.warn('[PixiGlow] glow layer unavailable, running without it:', e));
     engine.loadLevel(level);
     engine.start();
 
@@ -70,6 +77,7 @@ export function GameCanvas({ level, audio, callbacks, engineRef }: GameCanvasPro
     window.addEventListener('pointerdown', unlock, { once: true });
 
     return () => {
+      disposed = true;
       engine.stop();
       engine.unbindKeys();
       engine.setPixiGlow(null);

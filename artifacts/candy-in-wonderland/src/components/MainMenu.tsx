@@ -1,20 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { SaveProfile, GameSettings } from '../game/types';
 import { loadProfiles, createNewProfile, saveProfile, deleteProfile } from '../game/SaveSystem';
+import { AssetPaths } from '../data/assets';
 
-// Asset paths (all served from /public)
-const A = {
-  title:    '/assets/ui/menu/01_title_candy_in_wonderland_text.png',
-  subtitle: '/assets/ui/menu/02_subtitle_mystery_adventure_text.png',
-  btnStart: '/assets/ui/menu/03_start_game_button_text.png',
-  btnOpts:  '/assets/ui/menu/04_options_button_text.png',
-  btnCreds: '/assets/ui/menu/05_credits_button_text.png',
-  anyKey:   '/assets/ui/menu/06_press_any_key_text.png',
-  sign1:    '/assets/ui/menu/07_signpost_tea_party_lane_text.png',
-  sign2:    '/assets/ui/menu/08_signpost_cheshire_woods_text.png',
-  sign3:    '/assets/ui/menu/09_signpost_queens_court_text.png',
-  candy:    '/assets/characters/candy_idle.png',
-};
+// Menu art. `candy` is Candy's actual full-body game sprite — the menu used to
+// show her dialogue portrait (a head-and-shoulders bust) as if it were a
+// character sprite, which is why she read as cropped here.
+const A = AssetPaths.menu;
 
 interface MainMenuProps {
   onStartGame: (profile: SaveProfile) => void;
@@ -206,7 +198,7 @@ export function MainMenu({ onStartGame, settings, onSettingsChange }: MainMenuPr
         {/* Candy character */}
         <div style={{
           margin: '18px auto 0',
-          width: 'min(110px, 22vw)',
+          width: 'min(150px, 30vw)',
           filter: 'drop-shadow(0 0 18px rgba(155,89,182,0.7)) drop-shadow(0 0 36px rgba(155,89,182,0.3))',
         }}>
           <img src={A.candy} alt="Candy"
@@ -264,7 +256,16 @@ function MenuWrapper({ children }: { children: React.ReactNode }) {
       fontFamily: '"Courier New", Courier, monospace',
       overflow: 'hidden',
     }}>
-      {/* Star field */}
+      {/* Painted night sky, under the gradient wash */}
+      <div style={{
+        position: 'absolute', inset: 0, pointerEvents: 'none',
+        backgroundImage: `url(${A.starfield})`,
+        backgroundSize: 'cover',
+        backgroundPosition: 'center',
+        opacity: 0.55,
+      }} />
+
+      {/* Drifting star field on top of the plate */}
       <div style={{ position: 'absolute', inset: 0, overflow: 'hidden', pointerEvents: 'none' }}>
         {Array.from({ length: 55 }, (_, i) => (
           <div key={i} style={{

@@ -3,6 +3,7 @@ import { TILE_SIZE, PLAYER_SPEED, PLAYER_MAX_HP } from './types';
 import type { LevelData } from './types';
 import { AudioManager } from './AudioManager';
 import type { PixiGlow } from './PixiGlow';
+import { AssetPaths, COURTYARD_FOCAL_Y, bossSpriteFor, npcSpriteKey, portraitFor } from '../data/assets';
 
 const WALK_FRAMES = 4;
 const WALK_SPEED = 8; // frames per step
@@ -121,6 +122,10 @@ export class GameEngine {
   // Level 1 static background cache
   private level1BgCache: HTMLCanvasElement | null = null;
 
+  // Tinted boss plate cache (rebuilt when the level changes)
+  private bossSpriteCanvas: HTMLCanvasElement | null = null;
+  private bossSpriteKey = '';
+
   // Offscreen canvas for character outline rendering
   private charOfc: HTMLCanvasElement = document.createElement('canvas');
 
@@ -144,84 +149,69 @@ export class GameEngine {
   }
 
   private loadAssets() {
-    // White-bg PNGs (Format24bppRgb, no alpha channel): remove white background via flood-fill
-    // scholar.png already has a transparent background — must NOT be in this set
-    const needsWhiteRemoval = new Set(['candyFront', 'candyBack', 'witness', 'wanderer']);
+    // Every PNG under public/assets is produced by tools/build-assets.py and already
+    // ships a clean alpha channel, trimmed to the artwork. The engine used to run a
+    // full-image BFS flood-fill over five 1–3 MP images on every boot to strip white
+    // backgrounds; that work now happens once at build time instead of on every load.
+    this.loadSprite('candyFront', AssetPaths.characters.candyFront);
+    this.loadSprite('candyBack',  AssetPaths.characters.candyBack);
+    this.loadSprite('witness',    AssetPaths.npcs.witness);
+    this.loadSprite('scholar',    AssetPaths.npcs.scholar);
+    this.loadSprite('wanderer',   AssetPaths.npcs.wanderer);
+    this.loadSprite('detective',  AssetPaths.npcs.detective);
+    this.loadSprite('bench',      AssetPaths.props.bench);
 
-    const loadSprite = (key: string, src: string) => {
-      const img = new Image();
-      img.onload = () => {
-        if (needsWhiteRemoval.has(key)) {
-          this.sprites[key] = this.removeWhiteBg(img);
-        } else {
-          // Image already has transparency — copy to canvas directly
-          const ofc = document.createElement('canvas');
-          ofc.width = img.naturalWidth;
-          ofc.height = img.naturalHeight;
-          ofc.getContext('2d')!.drawImage(img, 0, 0);
-          this.sprites[key] = ofc;
-        }
-      };
-      img.src = src;
-      this.assets[key] = img;
-    };
-
-    loadSprite('candyFront', '/assets/characters/candy_front.png');
-    loadSprite('candyBack',  '/assets/characters/candy_back.png');
-    loadSprite('witness',    '/assets/npcs/witness.png');
-    loadSprite('scholar',    '/assets/npcs/scholar.png');
-    loadSprite('wanderer',   '/assets/npcs/wanderer.png');
-
-    // Background loaded as raw HTMLImageElement (drawn directly, not via sprites)
+    // Background is drawn straight from the <img>, not through the sprite cache.
     const bg = new Image();
-    bg.src = '/assets/backgrounds/courtyard.png';
+    bg.src = AssetPaths.backgrounds.courtyard;
     this.assets['courtyard'] = bg;
   }
 
-  private removeWhiteBg(img: HTMLImageElement, tolerance = 48): HTMLCanvasElement {
-    const ofc = document.createElement('canvas');
-    ofc.width = img.naturalWidth;
-    ofc.height = img.naturalHeight;
-    const ctx = ofc.getContext('2d')!;
-    ctx.drawImage(img, 0, 0);
-    const W = ofc.width, H = ofc.height;
-    const imageData = ctx.getImageData(0, 0, W, H);
-    const d = imageData.data;
-
-    // Sample background color from top-left corner pixel
-    const bgR = d[0], bgG = d[1], bgB = d[2];
-
-    // BFS flood-fill from all 4 corners to identify only background-connected pixels
-    const visited = new Uint8Array(W * H);
-    const queue: number[] = [];
-
-    const enqueue = (px: number) => {
-      if (px < 0 || px >= W * H || visited[px]) return;
-      const i = px * 4;
-      if (Math.abs(d[i] - bgR) <= tolerance &&
-          Math.abs(d[i+1] - bgG) <= tolerance &&
-          Math.abs(d[i+2] - bgB) <= tolerance) {
-        visited[px] = 1;
-        queue.push(px);
-      }
+  /**
+   * Load one PNG into the sprite cache. Assets are pre-cut by the build pipeline,
+   * so this is a straight copy onto a canvas — no background stripping at runtime.
+   */
+  private loadSprite(key: string, src: string) {
+    const img = new Image();
+    img.onload = () => {
+      const ofc = document.createElement('canvas');
+      ofc.width = img.naturalWidth;
+      ofc.height = img.naturalHeight;
+      ofc.getContext('2d')!.drawImage(img, 0, 0);
+      this.sprites[key] = ofc;
     };
+    img.onerror = () => console.warn(`[assets] failed to load ${src}`);
+    img.src = src;
+    this.assets[key] = img;
+  }
 
-    enqueue(0); enqueue(W - 1); enqueue((H - 1) * W); enqueue(H * W - 1);
-    while (queue.length > 0) {
-      const px = queue.pop()!;
-      const x = px % W, y = Math.floor(px / W);
-      if (x > 0) enqueue(px - 1);
-      if (x < W - 1) enqueue(px + 1);
-      if (y > 0) enqueue(px - W);
-      if (y < H - 1) enqueue(px + W);
+  /**
+   * Boss plate tinted with the current level's suit colour, built once per level.
+   * The tint is composited on an offscreen canvas so `source-atop` masks to the
+   * sprite itself rather than to everything already painted on the main canvas.
+   */
+  private getBossSprite(): HTMLCanvasElement | null {
+    const base = this.sprites['boss'];
+    if (!base) return null;
+    const tint = this.level?.bossConfig?.suitTint ?? '';
+    const key = `${this.level?.id}:${tint}:${base.width}x${base.height}`;
+    if (this.bossSpriteCanvas && this.bossSpriteKey === key) return this.bossSpriteCanvas;
+
+    const ofc = document.createElement('canvas');
+    ofc.width = base.width;
+    ofc.height = base.height;
+    const c = ofc.getContext('2d')!;
+    c.drawImage(base, 0, 0);
+    if (tint) {
+      c.globalCompositeOperation = 'source-atop';
+      c.globalAlpha = 0.34;
+      c.fillStyle = tint;
+      c.fillRect(0, 0, ofc.width, ofc.height);
+      c.globalCompositeOperation = 'source-over';
+      c.globalAlpha = 1;
     }
-
-    // Erase only background-connected pixels + feather the edge
-    for (let px = 0; px < W * H; px++) {
-      if (visited[px]) d[px * 4 + 3] = 0;
-    }
-
-    ctx.putImageData(imageData, 0, 0);
+    this.bossSpriteCanvas = ofc;
+    this.bossSpriteKey = key;
     return ofc;
   }
 
@@ -250,6 +240,9 @@ export class GameEngine {
     this.updateCamera(true);
     this.setGameState('exploring');
     this.level1BgCache = null;
+    // This level's boss plate; the tint cache is keyed on level id so it rebuilds.
+    this.bossSpriteCanvas = null;
+    this.loadSprite('boss', bossSpriteFor(level.id));
     // Notify PixiGlow of new level data (if already attached)
     if (this.pixiGlow) {
       this.pixiGlow.setupLevel(this.tiles, level.id);
@@ -513,7 +506,11 @@ export class GameEngine {
   }
 
   private startDialogue(npc: NPCData, index: number) {
-    this.dialogueLines = npc.dialogue;
+    // Tag every line with the portrait for this NPC's slot so the dialogue UI
+    // shows matching art on all 20 levels, not just where the NPC happens to be
+    // named "Witness" / "Scholar" / "Wanderer".
+    const portrait = portraitFor(npc.name, npcSpriteKey(this.level.id, index));
+    this.dialogueLines = npc.dialogue.map(l => (l.portrait ? l : { ...l, portrait: portrait ?? undefined }));
     this.dialogueIndex = 0;
     this.pendingClueId = null;
 
@@ -1058,9 +1055,15 @@ export class GameEngine {
     // ── Courtyard background PNG ─────────────────────────────────────────
     const bgImg = this.assets['courtyard'];
     if (bgImg?.complete && bgImg.naturalWidth > 0) {
-      // Scale PNG to cover map width; image is portrait so it extends below — that's fine
+      // The plate is portrait and the map is landscape, so it can only cover the
+      // map width. Pinned to the top it showed the arch and cut everything below
+      // the fountain off the map — which is why the lower courtyard read as empty.
+      // Anchor it on the painted fountain instead, so that fountain lands on the
+      // fountain tile the animated overlays are drawn at and the benches, signs
+      // and lower cobblestone all fall inside the playable area.
       const drawH = mapW * (bgImg.naturalHeight / bgImg.naturalWidth);
-      ctx.drawImage(bgImg, 0, 0, mapW, drawH);
+      const offY = Math.min(0, Math.max(mapH - drawH, fcy - COURTYARD_FOCAL_Y * drawH));
+      ctx.drawImage(bgImg, 0, offY, mapW, drawH);
     } else {
       // Fallback: code-drawn static background while PNG loads
       if (!this.level1BgCache) {
@@ -2043,8 +2046,7 @@ export class GameEngine {
       ctx.ellipse(x, y + 16, 16, 5, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // PNG sprite lookup: 0=Witness, 1=Scholar, 2+=Wanderer/Guard
-      const sprKey = i === 0 ? 'witness' : i === 1 ? 'scholar' : 'wanderer';
+      const sprKey = npcSpriteKey(this.level.id, i);
       const spr = this.sprites[sprKey];
       const bobY = Math.sin(this.time * 0.07 + i * 1.2) * 2;
 
@@ -2543,16 +2545,22 @@ export class GameEngine {
       ctx.ellipse(mx, my + 16, shadowW, shadowH, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // For left/right: squeeze the sprite horizontally to fake a side-profile view.
-      // scaleX = 0.38 gives a slim silhouette that reads as "turning sideways".
-      // For up/down: normal full-width render.
+      // No side-facing art exists for Candy, so left/right is faked by narrowing
+      // the front sprite into a three-quarter turn. 0.62 still reads as a person;
+      // the old 0.38 flattened her into a sliver. The mirror plus an opposite lean
+      // and a small weight shift is what makes left and right tell apart.
       const isSideways = this.facing === 'left' || this.facing === 'right';
-      const scaleX = isSideways ? (facingLeft ? -0.38 : 0.38) : (facingLeft ? -1 : 1);
+      const dir = facingLeft ? -1 : 1;
+      const scaleX = isSideways ? dir * 0.62 : 1;
+      const leanRad = isSideways ? dir * 0.06 : 0;
+      const leadX   = isSideways ? dir * 3 : 0;
 
       ctx.save();
-      ctx.translate(mx + swayX, my + 16 + bobY);
+      ctx.translate(mx + swayX + leadX, my + 16 + bobY);
+      // Rotate before scale so the lean stays in world space and does not flip
+      // direction along with the mirrored sprite.
+      ctx.rotate(tiltRad * dir + leanRad);
       ctx.scale(scaleX, 1);
-      ctx.rotate(tiltRad);
       ctx.shadowColor = 'rgba(0,0,0,0.85)';
       ctx.shadowBlur = 5;
       ctx.drawImage(spr, -w / 2, -h, w, h);
@@ -2880,29 +2888,42 @@ export class GameEngine {
       ctx.fill();
     }
 
-    // Boss body
-    const bodyColor = this.bossDead ? '#FF4444' : (flashing ? '#FFFFFF' : '#4A0080');
-    ctx.fillStyle = bodyColor;
+    // Boss body — the level's boss plate, tinted with its suit colour.
+    // Falls back to the original orb only while the art is still loading.
     const bodyPulse = Math.sin(this.time * 0.1) * 3;
-    ctx.beginPath();
-    ctx.arc(x, y, 28 + bodyPulse, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Core
-    ctx.fillStyle = flashing ? '#FF8800' : '#7B2FBE';
-    ctx.beginPath();
-    ctx.arc(x, y, 16, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Eye
-    ctx.fillStyle = '#FF0000';
-    ctx.beginPath();
-    ctx.arc(x, y, 8, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#FFFFFF';
-    ctx.beginPath();
-    ctx.arc(x - 2, y - 2, 3, 0, Math.PI * 2);
-    ctx.fill();
+    const bossSpr = this.getBossSprite();
+    if (bossSpr) {
+      const bh = 138 + bodyPulse;
+      const bw = bh * (bossSpr.width / bossSpr.height);
+      ctx.save();
+      if (this.bossDead) ctx.globalAlpha = Math.max(0, 1 - this.bossDeathTimer / 130);
+      if (flashing) ctx.filter = 'brightness(2.4) saturate(0.35)';
+      ctx.shadowColor = bossAura;
+      ctx.shadowBlur = 16;
+      ctx.drawImage(bossSpr, x - bw / 2, y + 26 - bh, bw, bh);
+      ctx.shadowBlur = 0;
+      ctx.shadowColor = 'transparent';
+      ctx.filter = 'none';
+      ctx.restore();
+    } else {
+      const bodyColor = this.bossDead ? '#FF4444' : (flashing ? '#FFFFFF' : '#4A0080');
+      ctx.fillStyle = bodyColor;
+      ctx.beginPath();
+      ctx.arc(x, y, 28 + bodyPulse, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = flashing ? '#FF8800' : '#7B2FBE';
+      ctx.beginPath();
+      ctx.arc(x, y, 16, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#FF0000';
+      ctx.beginPath();
+      ctx.arc(x, y, 8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath();
+      ctx.arc(x - 2, y - 2, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
     // Name tag
     if (!this.bossDead) {
@@ -3056,6 +3077,23 @@ export class GameEngine {
   }
 
   private drawBench(ctx: CanvasRenderingContext2D, x: number, y: number) {
+    // Painted bench where the art has loaded. Level 1 does not come through here —
+    // its benches are already in the courtyard plate — so this only dresses 2-20.
+    const spr = this.sprites['bench'];
+    if (spr) {
+      const bw = 58;
+      const bh = bw * (spr.height / spr.width);
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,0.30)';
+      ctx.beginPath();
+      ctx.ellipse(x, y + 10, bw * 0.44, 5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.drawImage(spr, x - bw / 2, y + 10 - bh, bw, bh);
+      ctx.restore();
+      return;
+    }
+
+    // Fallback: code-drawn bench
     // Back rest (top, since top-down)
     ctx.fillStyle = '#3D2B1F';
     ctx.fillRect(x - 24, y - 20, 48, 8);
