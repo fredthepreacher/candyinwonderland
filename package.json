@@ -1,0 +1,11 @@
+{
+  "name": "candy-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@11.6.0",
+  "scripts": {
+    "dev": "pnpm --dir artifacts/candy-in-wonderland exec vite --config vite.config.local.ts",
+    "build": "pnpm --dir artifacts/candy-in-wonderland exec vite build --config vite.config.local.ts",
+    "preview": "pnpm --dir artifacts/candy-in-wonderland exec vite preview --config vite.config.local.ts"
+  }
+}
