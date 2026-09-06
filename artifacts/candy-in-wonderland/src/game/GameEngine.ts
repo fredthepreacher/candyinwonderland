@@ -4,6 +4,9 @@ import type { LevelData } from './types';
 import { AudioManager } from './AudioManager';
 import type { PixiGlow } from './PixiGlow';
 import { AssetPaths, COURTYARD_FOCAL_Y, bossSpriteFor, npcSpriteKey, portraitFor } from '../data/assets';
+import { Lighting, QUALITY } from './Lighting';
+import type { Light, LightingQuality } from './Lighting';
+import { COURTYARD_LIGHTS } from '../data/courtyard-lights';
 
 const WALK_FRAMES = 4;
 const WALK_SPEED = 8; // frames per step
@@ -92,6 +95,25 @@ export class GameEngine {
   // Camera
   private camX = 0; private camY = 0;
   private cameraZoom = 0.68; // <1 = zoomed out (more world visible, smaller characters)
+
+  // Viewport, in LOGICAL pixels. The canvas backing store is this multiplied by
+  // `dpr`; everything in the engine works in logical pixels and the device-pixel
+  // scale is applied once, as the base transform in render().
+  private viewW = 1;
+  private viewH = 1;
+  private dpr = 1;
+
+  // Lighting
+  private lighting = new Lighting();
+  /** Lights that never move for this level. Rebuilt on load, not per frame. */
+  private staticLights: Light[] | null = null;
+  private frameLights: Light[] = [];
+  /** Ambient light — the exposure of everything no lamp reaches. Never black. */
+  private ambient: [number, number, number] = [178, 168, 198];
+
+  // Frame timing, for the debug HUD
+  private fps = 60;
+  private frameMs = 0;
 
   // PNG asset sprites (raw images + processed canvases with white bg removed)
   private assets: Record<string, HTMLImageElement> = {};
@@ -242,11 +264,151 @@ export class GameEngine {
     this.level1BgCache = null;
     // This level's boss plate; the tint cache is keyed on level id so it rebuilds.
     this.bossSpriteCanvas = null;
+    this.staticLights = null; // rebuilt lazily once this level's plate is loaded
     this.loadSprite('boss', bossSpriteFor(level.id));
     // Notify PixiGlow of new level data (if already attached)
     if (this.pixiGlow) {
       this.pixiGlow.setupLevel(this.tiles, level.id);
     }
+  }
+
+  /**
+   * Tell the engine the viewport size in LOGICAL pixels and the device-pixel
+   * ratio the canvas backing store was sized at. Rendering at device pixels is
+   * what stops the browser upscaling the art on a Retina screen or a phone;
+   * because the tilt transform also scales the canvas down, drawing at 2x and
+   * letting the compositor resolve it is effectively free supersampling.
+   */
+  setViewport(logicalW: number, logicalH: number, dpr: number) {
+    this.viewW = Math.max(1, logicalW);
+    this.viewH = Math.max(1, logicalH);
+    this.dpr = dpr;
+    this.lighting.resize(this.viewW, this.viewH);
+  }
+
+  setLightingQuality(q: LightingQuality) {
+    this.lighting.setQuality(q);
+  }
+
+  /**
+   * Lights that do not move for this level, in world space.
+   *
+   * Level 1 is painted rather than tiled, so its lights come from the plate:
+   * tools/bake-lights.py found the flames in the artwork and stored them as
+   * normalised plate coordinates, which we push through the same transform
+   * drawLevel1Scene() uses. That is what keeps a pool of light sitting on the
+   * candle that was painted for it rather than floating somewhere near it.
+   *
+   * Returns false while the plate is still loading, so it is retried.
+   */
+  private buildStaticLights(): boolean {
+    const S = TILE_SIZE;
+    const mapW = this.tiles[0].length * S;
+    const mapH = this.tiles.length * S;
+    const out: Light[] = [];
+    let seed = 0;
+
+    if (this.level.id === 1) {
+      const bg = this.assets['courtyard'];
+      if (!bg?.complete || !bg.naturalWidth) return false;
+      const drawH = mapW * (bg.naturalHeight / bg.naturalWidth);
+      const offY = Math.min(0, Math.max(mapH - drawH, 7 * S - COURTYARD_FOCAL_Y * drawH));
+      for (const L of COURTYARD_LIGHTS) {
+        out.push({
+          x: L.u * mapW,
+          y: offY + L.v * drawH,
+          radius: L.radius,
+          color: L.color,
+          intensity: L.intensity,
+          flicker: L.flicker,
+          seed: seed++ * 1.7,
+        });
+      }
+    } else {
+      // Tiled levels: candles are tile type 6 and are actually drawn there, so
+      // tile coordinates are the right source here.
+      let fx = 0, fy = 0, fn = 0;
+      for (let ty = 0; ty < this.tiles.length; ty++) {
+        for (let tx = 0; tx < this.tiles[ty].length; tx++) {
+          const tile = this.tiles[ty][tx];
+          if (tile === 6) {
+            out.push({
+              x: tx * S + S / 2, y: ty * S + S / 2,
+              radius: 155, color: [255, 188, 112],
+              intensity: 0.95, flicker: 0.34, seed: seed++ * 1.7,
+            });
+          } else if (tile === 3) {
+            fx += tx * S + S / 2; fy += ty * S + S / 2; fn++;
+          }
+        }
+      }
+      // One broad light at the centroid of the water tiles — the fountain.
+      if (fn > 0) {
+        out.push({
+          x: fx / fn, y: fy / fn,
+          radius: 300, color: [126, 168, 255],
+          intensity: 0.72, flicker: 0.07, seed: seed++ * 1.7,
+        });
+      }
+    }
+
+    this.staticLights = out;
+    return true;
+  }
+
+  /** Parse the rgb out of an `rgba(r,g,b,a)` string from the boss config. */
+  private static parseRgb(css: string, fallback: [number, number, number]): [number, number, number] {
+    const m = css.match(/(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : fallback;
+  }
+
+  /**
+   * Static lights plus everything that moves. Reuses one array so a full light
+   * set does not allocate 20 objects every frame.
+   */
+  private collectLights(): Light[] {
+    if (!this.staticLights) this.buildStaticLights();
+    const lights = this.frameLights;
+    lights.length = 0;
+    if (this.staticLights) for (const L of this.staticLights) lights.push(L);
+
+    // Candy carries a soft lamp of her own. Beyond looking right for a
+    // detective in a dark courtyard, it guarantees the ground she is standing
+    // on is readable wherever she walks — including the lower courtyard, which
+    // has no painted candles near it.
+    lights.push({
+      x: this.px, y: this.py + 6, radius: 235,
+      color: [156, 150, 214], intensity: 0.52, flicker: 0.04, seed: 11.3,
+    });
+
+    if (!this.hiddenClueCollected && this.level.hiddenCluePos) {
+      lights.push({
+        x: this.level.hiddenCluePos.x * TILE_SIZE + TILE_SIZE / 2,
+        y: this.level.hiddenCluePos.y * TILE_SIZE + TILE_SIZE / 2,
+        radius: 135, color: [255, 214, 120],
+        intensity: 0.62, flicker: 0.30, seed: 5.1,
+      });
+    }
+
+    if (this.gateOpen && this.level.gatePos) {
+      lights.push({
+        x: this.level.gatePos.x * TILE_SIZE + TILE_SIZE / 2,
+        y: this.level.gatePos.y * TILE_SIZE + TILE_SIZE / 2,
+        radius: 170, color: [186, 138, 255],
+        intensity: 0.50, flicker: 0.10, seed: 8.6,
+      });
+    }
+
+    if (this.bossActive && !this.bossDefeated) {
+      lights.push({
+        x: this.bossX, y: this.bossY, radius: 260,
+        color: GameEngine.parseRgb(this.level.bossConfig?.aura ?? '', [190, 90, 255]),
+        intensity: this.bossFlash > 0 ? 1 : 0.82,
+        flicker: 0.22, seed: 2.9,
+      });
+    }
+
+    return lights;
   }
 
   private bindKeys() {
@@ -312,9 +474,18 @@ export class GameEngine {
     this.animId = requestAnimationFrame(this.loop);
     const dt = Math.min((now - this.lastTime) / 16.667, 3);
     this.lastTime = now;
-    this.time++;
+    // `time` advances by dt, not by 1. It used to be a frame counter, which made
+    // every animation driven off it — the walk bob, candle flicker, boss orbit,
+    // fountain — run at the monitor's refresh rate. On a 144 Hz screen Candy's
+    // legs pumped 2.4x faster than on a 60 Hz one. dt is normalised to 60 fps
+    // units, so `time` now advances 60 per second on any display and every
+    // multiplier tuned against the old counter stays correct.
+    this.time += dt;
+    const t0 = performance.now();
     this.update(dt);
     this.render();
+    this.frameMs += (performance.now() - t0 - this.frameMs) * 0.1;
+    this.fps += ((dt > 0 ? 60 / dt : 60) - this.fps) * 0.05;
     this.prevKeys = { ...this.keys };
     this.prevMobile = { ...this.mobileInput };
   };
@@ -829,8 +1000,8 @@ export class GameEngine {
 
   private updateCamera(snap: boolean) {
     const z = this.cameraZoom;
-    const vpW = this.canvas.width / z;
-    const vpH = this.canvas.height / z;
+    const vpW = this.viewW / z;
+    const vpH = this.viewH / z;
     const targetX = this.px - vpW / 2;
     const targetY = this.py - vpH / 2;
     const mapW = this.tiles[0].length * TILE_SIZE;
@@ -890,8 +1061,8 @@ export class GameEngine {
     // Spawn a slow-drifting purple mote in the visible viewport area
     const vx = (Math.random() - 0.5) * 0.6;
     const vy = -(Math.random() * 0.8 + 0.3);
-    const spawnX = this.camX + Math.random() * (this.canvas.width / this.cameraZoom);
-    const spawnY = this.camY + Math.random() * (this.canvas.height / this.cameraZoom);
+    const spawnX = this.camX + Math.random() * (this.viewW / this.cameraZoom);
+    const spawnY = this.camY + Math.random() * (this.viewH / this.cameraZoom);
     const hue = 260 + Math.floor(Math.random() * 60);
     this.particles.push({
       x: spawnX, y: spawnY,
@@ -919,9 +1090,12 @@ export class GameEngine {
 
   private render() {
     const ctx = this.ctx;
-    const W = this.canvas.width;
-    const H = this.canvas.height;
+    const W = this.viewW;
+    const H = this.viewH;
 
+    // The one place the device-pixel scale is applied. Everything below this
+    // line works in logical pixels, so no other code has to know about DPR.
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = this.level.levelTheme.bg;
     ctx.fillRect(0, 0, W, H);
@@ -945,11 +1119,21 @@ export class GameEngine {
 
     ctx.restore();
 
-    // ── POST-PROCESS ATMOSPHERE ──────────────────────────────────────────────
+    // ── LIGHTING ─────────────────────────────────────────────────────────────
+    // Multiply the finished scene by the accumulated light buffer, then bloom
+    // the lights and lift the blacks. This replaces the flat 10% purple wash
+    // that used to stand in for atmosphere: that darkened every pixel equally,
+    // which is why the courtyard read at one exposure everywhere.
+    this.lighting.render(
+      ctx,
+      this.collectLights(),
+      this.ambient,
+      { x: this.camX - this.shakeX, y: this.camY - this.shakeY, zoom: this.cameraZoom },
+      this.time,
+    );
+    this.lighting.grade(ctx, W, H, [64, 54, 92], 0.055);
 
-    // 1. Subtle ambient purple lift — keep dark fantasy mood but allow midtones to read
-    ctx.fillStyle = 'rgba(18,8,36,0.10)';
-    ctx.fillRect(0, 0, W, H);
+    // ── POST-PROCESS ATMOSPHERE ──────────────────────────────────────────────
 
     // 2. Edge fog — narrow bands only so center of map stays visible
     const fogT = ctx.createLinearGradient(0, 0, 0, H * 0.18);
@@ -976,22 +1160,17 @@ export class GameEngine {
     ctx.fillStyle = fogR;
     ctx.fillRect(W * 0.90, 0, W * 0.10, H);
 
-    // 3. Subtle purple bloom at fountain center — kept low to avoid wash
-    const fxScreen = W / 2;
-    const fyScreen = H * 0.38;
-    const bloom = ctx.createRadialGradient(fxScreen, fyScreen, 10, fxScreen, fyScreen, H * 0.32);
-    bloom.addColorStop(0, `rgba(80,30,150,${0.035 + Math.sin(this.time * 0.04) * 0.012})`);
-    bloom.addColorStop(0.5, `rgba(50,10,90,${0.015})`);
-    bloom.addColorStop(1, 'rgba(30,0,60,0)');
-    ctx.fillStyle = bloom;
-    ctx.fillRect(0, 0, W, H);
+    // 3. The fountain used to get a hand-painted screen-space bloom pinned to a
+    //    fixed point on screen, which slid off the fountain as the camera moved.
+    //    It is a real world-space light now, so this is gone.
 
-    // 4. Vignette — gentle fade, center stays fully lit
+    // 4. Vignette — softer than before, because the light falloff now does most
+    //    of this work in world space instead of as a fixed screen overlay
     const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.28, W / 2, H / 2, H * 0.82);
     vg.addColorStop(0, 'rgba(0,0,0,0)');
-    vg.addColorStop(0.60, 'rgba(0,0,0,0.06)');
-    vg.addColorStop(0.82, 'rgba(0,0,0,0.28)');
-    vg.addColorStop(1,    'rgba(0,0,0,0.52)');
+    vg.addColorStop(0.60, 'rgba(0,0,0,0.04)');
+    vg.addColorStop(0.82, 'rgba(0,0,0,0.18)');
+    vg.addColorStop(1,    'rgba(0,0,0,0.38)');
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, W, H);
 
@@ -1021,6 +1200,10 @@ export class GameEngine {
       const tileY = Math.floor(this.py / TILE_SIZE);
       const tile = (this.tiles[tileY]?.[tileX] ?? -1);
       const lines = [
+        `FPS  ${this.fps.toFixed(0)}   frame ${this.frameMs.toFixed(2)} ms   dpr ${this.dpr}`,
+        `VIEW ${this.viewW}x${this.viewH} logical  ->  ${this.canvas.width}x${this.canvas.height} device`,
+        `LIGHTS  ${this.lighting.lastDrawnCount} drawn / ${this.lighting.lastLightCount} total`,
+        `PARTICLES  ${this.particles.length}`,
         `POS  world:(${Math.round(this.px)}, ${Math.round(this.py)})  tile:(${tileX}, ${tileY})`,
         `FACING   ${this.facing}   MOVING ${this.moving}`,
         `GATE   ${this.gateOpen ? 'OPEN ✓' : 'CLOSED ✗'}   TILE at pos: ${tile}`,
@@ -1031,11 +1214,11 @@ export class GameEngine {
       ];
       ctx.save();
       ctx.fillStyle = 'rgba(0,0,0,0.72)';
-      ctx.fillRect(8, 8, 360, lines.length * 18 + 12);
+      ctx.fillRect(8, 8, 400, lines.length * 18 + 12);
       ctx.font = '12px monospace';
       ctx.textBaseline = 'top';
       lines.forEach((line, i) => {
-        ctx.fillStyle = i === 2 ? (this.gateOpen ? '#88ff88' : '#ff8888') : '#e8e8ff';
+        ctx.fillStyle = i < 3 ? '#9ee8b0' : i === 6 ? (this.gateOpen ? '#88ff88' : '#ff8888') : '#e8e8ff';
         ctx.fillText(line, 14, 14 + i * 18);
       });
       ctx.restore();
@@ -1713,9 +1896,9 @@ export class GameEngine {
     const rows = this.tiles.length;
     const cols = this.tiles[0].length;
     const startRow = Math.floor(this.camY / TILE_SIZE) - 1;
-    const endRow = Math.ceil((this.camY + this.canvas.height) / TILE_SIZE) + 1;
+    const endRow = Math.ceil((this.camY + this.viewH / this.cameraZoom) / TILE_SIZE) + 1;
     const startCol = Math.floor(this.camX / TILE_SIZE) - 1;
-    const endCol = Math.ceil((this.camX + this.canvas.width) / TILE_SIZE) + 1;
+    const endCol = Math.ceil((this.camX + this.viewW / this.cameraZoom) / TILE_SIZE) + 1;
 
     for (let row = Math.max(0, startRow); row < Math.min(rows, endRow); row++) {
       for (let col = Math.max(0, startCol); col < Math.min(cols, endCol); col++) {
