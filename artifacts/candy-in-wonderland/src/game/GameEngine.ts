@@ -636,6 +636,24 @@ export class GameEngine {
     return tile === 1 || tile === 2 || tile === 3;
   }
 
+  /**
+   * Is this NPC close enough, and is Candy facing the right way, to talk?
+   *
+   * Both the interact key and the on-screen highlight go through this, so the
+   * glow can never promise a conversation the key press will not deliver. The
+   * reach box is offset in the direction Candy faces — you talk to who you are
+   * looking at, not whoever happens to be nearest.
+   */
+  private isNpcInReach(nx: number, ny: number): boolean {
+    const range = INTERACT_RANGE;
+    let dx = 0, dy = 0;
+    if (this.facing === 'up') dy = -range;
+    else if (this.facing === 'down') dy = range;
+    else if (this.facing === 'left') dx = -range;
+    else dx = range;
+    return Math.abs(this.px + dx - nx) < 48 && Math.abs(this.py + dy - ny) < 48;
+  }
+
   private checkInteract() {
     const range = INTERACT_RANGE;
     let dx = 0, dy = 0;
@@ -652,7 +670,7 @@ export class GameEngine {
       const npc = this.level.npcs[i];
       const nx = npc.x * TILE_SIZE + TILE_SIZE / 2;
       const ny = npc.y * TILE_SIZE + TILE_SIZE / 2;
-      if (Math.abs(checkX - nx) < 48 && Math.abs(checkY - ny) < 48) {
+      if (this.isNpcInReach(nx, ny)) {
         this.startDialogue(npc, i);
         return;
       }
@@ -2233,13 +2251,41 @@ export class GameEngine {
       const spr = this.sprites[sprKey];
       const bobY = Math.sin(this.time * 0.07 + i * 1.2) * 2;
 
+      // Can Candy talk to this one right now? Everything below keys off this, so
+      // the highlight is a promise the interact key actually keeps.
+      const inReach = this.isNpcInReach(x, y);
+
+      // Standing ring on the ground when in reach — reads at a glance without
+      // covering the character, and sits in world space so it tracks properly
+      // under the tilt rather than floating like a screen-space marker.
+      if (inReach) {
+        const pulse = 0.5 + Math.sin(this.time * 0.14) * 0.5;
+        ctx.save();
+        ctx.strokeStyle = `rgba(255,214,140,${0.32 + pulse * 0.34})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.ellipse(x, y + 16, 22 + pulse * 3, 8 + pulse * 1.5, 0, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
+
       if (spr) {
         const h = 84;
         const w = h * (spr.width / spr.height);
+        // Turn to face Candy. There is only a front-facing plate per NPC, so
+        // mirroring is the whole trick — but it is enough to stop everyone
+        // staring rigidly past her.
+        const faceLeft = this.px < x - 6;
         ctx.save();
         ctx.translate(x, y + 16 + bobY);
-        ctx.shadowColor = 'rgba(0,0,0,0.85)';
-        ctx.shadowBlur = 6;
+        ctx.scale(faceLeft ? -1 : 1, 1);
+        if (inReach) {
+          ctx.shadowColor = 'rgba(255,206,120,0.9)';
+          ctx.shadowBlur = 14;
+        } else {
+          ctx.shadowColor = 'rgba(0,0,0,0.85)';
+          ctx.shadowBlur = 6;
+        }
         ctx.drawImage(spr, -w / 2, -h, w, h);
         ctx.shadowBlur = 0;
         ctx.shadowColor = 'transparent';
@@ -2260,13 +2306,14 @@ export class GameEngine {
       // Interact indicator
       if (!interacted) {
         const bobY = Math.sin(this.time * 0.1) * 3;
-        // Speech bubble
-        ctx.fillStyle = 'rgba(240,235,255,0.97)';
+        // In reach the bubble turns gold and names the key; out of reach it stays
+        // the quiet "this one has something to say" marker it was.
+        ctx.fillStyle = inReach ? 'rgba(255,236,190,0.98)' : 'rgba(240,235,255,0.97)';
         ctx.beginPath();
         (ctx as any).roundRect(x - 17, y - 62 + bobY, 34, 19, 5);
         ctx.fill();
-        ctx.strokeStyle = 'rgba(180,140,255,0.5)';
-        ctx.lineWidth = 1;
+        ctx.strokeStyle = inReach ? 'rgba(255,196,90,0.95)' : 'rgba(180,140,255,0.5)';
+        ctx.lineWidth = inReach ? 1.6 : 1;
         ctx.stroke();
         // Bubble tail
         ctx.fillStyle = 'rgba(240,235,255,0.97)';
@@ -2275,12 +2322,23 @@ export class GameEngine {
         ctx.lineTo(x + 2, y - 38 + bobY);
         ctx.lineTo(x + 7, y - 44 + bobY);
         ctx.fill();
-        // Dots
-        ctx.fillStyle = '#6644AA';
-        for (let d = 0; d < 3; d++) {
-          ctx.beginPath();
-          ctx.arc(x - 6 + d * 6, y - 52 + bobY, 2.5, 0, Math.PI * 2);
-          ctx.fill();
+        if (inReach) {
+          // Name the key rather than drawing an abstract glyph — it is the same
+          // key on the keyboard and the on-screen INTERACT button.
+          ctx.fillStyle = '#5A3A00';
+          ctx.font = 'bold 11px monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('E', x, y - 52 + bobY);
+          ctx.textBaseline = 'alphabetic';
+        } else {
+          // Dots
+          ctx.fillStyle = '#6644AA';
+          for (let d = 0; d < 3; d++) {
+            ctx.beginPath();
+            ctx.arc(x - 6 + d * 6, y - 52 + bobY, 2.5, 0, Math.PI * 2);
+            ctx.fill();
+          }
         }
       } else {
         // Checkmark badge
