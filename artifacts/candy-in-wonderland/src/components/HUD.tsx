@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import type { Clue } from '../game/types';
+import { AssetPaths } from '../data/assets';
 
 interface HUDProps {
   hp: number;
@@ -83,15 +84,18 @@ export function HUD({
           </div>
           <div style={{ display: 'flex', gap: 2, justifyContent: 'center' }}>
             {Array.from({ length: maxHp }, (_, i) => (
-              <span key={i} style={{
-                fontSize: 14, lineHeight: 1,
-                filter: i < hp
-                  ? 'drop-shadow(0 0 4px #FF2255) drop-shadow(0 0 2px #FF0033)'
-                  : 'grayscale(1) opacity(0.2)',
-                transition: 'filter 0.3s',
-              }}>
-                ❤️
-              </span>
+              <img
+                key={i}
+                src={AssetPaths.ui.heart}
+                alt=""
+                style={{
+                  width: 14, height: 14, display: 'block',
+                  filter: i < hp
+                    ? 'drop-shadow(0 0 4px #FF2255) drop-shadow(0 0 2px #FF0033)'
+                    : 'grayscale(1) opacity(0.2)',
+                  transition: 'filter 0.3s',
+                }}
+              />
             ))}
           </div>
         </div>

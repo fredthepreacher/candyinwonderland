@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 import type { DialogueLine } from '../game/types';
+import { portraitFor } from '../data/assets';
 
 const CAT_STYLE: Record<string, { color: string; bg: string }> = {
   'VERIFIED RECORD':  { color: '#4ADE80', bg: 'rgba(74,222,128,0.12)' },
@@ -93,7 +94,7 @@ export function DialogueBox({ lines, index, textSpeed, onAdvance }: DialogueBoxP
             overflow: 'hidden',
             boxShadow: '0 0 14px rgba(120,0,220,0.4), inset 0 0 8px rgba(0,0,0,0.6)',
           }}>
-            <PortraitCanvas speaker={line.speaker} />
+            <PortraitCanvas speaker={line.speaker} src={line.portrait} />
           </div>
 
           {/* Right column: name header + text */}
@@ -187,20 +188,12 @@ export function DialogueBox({ lines, index, textSpeed, onAdvance }: DialogueBoxP
   );
 }
 
-// ── Portrait PNG map ─────────────────────────────────────────────────────────
-const PORTRAIT_PNGS: Record<string, string> = {
-  witness:   '/assets/portraits/witness_portrait.png',
-  scholar:   '/assets/portraits/scholar_portrait.png',
-  wanderer:  '/assets/portraits/wanderer_portrait.png',
-  candy:     '/assets/characters/candy_front.png',
-  // Alias common level-specific NPC names
-  archivist: '/assets/portraits/scholar_portrait.png',
-  nomad:     '/assets/portraits/wanderer_portrait.png',
-  detective: '/assets/portraits/witness_portrait.png',
-};
+// Portrait art comes from the asset manifest. `line.portrait` is resolved by the
+// engine (which knows the NPC's slot); the name lookup is the fallback for lines
+// that did not come from an NPC, such as Candy's own asides.
 
 // ── Portrait Canvas renderer ──────────────────────────────────────────────────
-function PortraitCanvas({ speaker }: { speaker: string }) {
+function PortraitCanvas({ speaker, src }: { speaker: string; src?: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -212,8 +205,8 @@ function PortraitCanvas({ speaker }: { speaker: string }) {
     canvas.height = H;
     ctx.clearRect(0, 0, W, H);
 
-    const sl = speaker.toLowerCase();
-    const pngSrc = PORTRAIT_PNGS[sl];
+    const sl = speaker.trim().toLowerCase();
+    const pngSrc = src ?? portraitFor(speaker);
 
     if (pngSrc) {
       const img = new Image();
@@ -253,7 +246,7 @@ function PortraitCanvas({ speaker }: { speaker: string }) {
     } else {
       drawGenericPortrait(ctx, W, H, speaker);
     }
-  }, [speaker]);
+  }, [speaker, src]);
 
   return <canvas ref={canvasRef} style={{ display: 'block', width: 88, height: 88 }} />;
 }

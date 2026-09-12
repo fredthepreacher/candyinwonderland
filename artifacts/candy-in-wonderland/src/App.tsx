@@ -77,6 +77,8 @@ function App() {
     onHealthChange: () => {},
     onBossChange: () => {},
     onGateOpen: () => {},
+    onBossUnlock: () => {},
+    onObjective: () => {},
     onLevelComplete: () => {},
     onClueCount: () => {},
   });

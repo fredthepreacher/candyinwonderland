@@ -3,6 +3,10 @@ import { TILE_SIZE, PLAYER_SPEED, PLAYER_MAX_HP } from './types';
 import type { LevelData } from './types';
 import { AudioManager } from './AudioManager';
 import type { PixiGlow } from './PixiGlow';
+import { AssetPaths, COURTYARD_FOCAL_Y, bossSpriteFor, npcSpriteKey, portraitFor } from '../data/assets';
+import { Lighting, QUALITY } from './Lighting';
+import type { Light, LightingQuality } from './Lighting';
+import { COURTYARD_LIGHTS } from '../data/courtyard-lights';
 
 const WALK_FRAMES = 4;
 const WALK_SPEED = 8; // frames per step
@@ -92,6 +96,25 @@ export class GameEngine {
   private camX = 0; private camY = 0;
   private cameraZoom = 0.68; // <1 = zoomed out (more world visible, smaller characters)
 
+  // Viewport, in LOGICAL pixels. The canvas backing store is this multiplied by
+  // `dpr`; everything in the engine works in logical pixels and the device-pixel
+  // scale is applied once, as the base transform in render().
+  private viewW = 1;
+  private viewH = 1;
+  private dpr = 1;
+
+  // Lighting
+  private lighting = new Lighting();
+  /** Lights that never move for this level. Rebuilt on load, not per frame. */
+  private staticLights: Light[] | null = null;
+  private frameLights: Light[] = [];
+  /** Ambient light — the exposure of everything no lamp reaches. Never black. */
+  private ambient: [number, number, number] = [178, 168, 198];
+
+  // Frame timing, for the debug HUD
+  private fps = 60;
+  private frameMs = 0;
+
   // PNG asset sprites (raw images + processed canvases with white bg removed)
   private assets: Record<string, HTMLImageElement> = {};
   private sprites: Record<string, HTMLCanvasElement> = {};
@@ -121,6 +144,10 @@ export class GameEngine {
   // Level 1 static background cache
   private level1BgCache: HTMLCanvasElement | null = null;
 
+  // Tinted boss plate cache (rebuilt when the level changes)
+  private bossSpriteCanvas: HTMLCanvasElement | null = null;
+  private bossSpriteKey = '';
+
   // Offscreen canvas for character outline rendering
   private charOfc: HTMLCanvasElement = document.createElement('canvas');
 
@@ -144,84 +171,69 @@ export class GameEngine {
   }
 
   private loadAssets() {
-    // White-bg PNGs (Format24bppRgb, no alpha channel): remove white background via flood-fill
-    // scholar.png already has a transparent background — must NOT be in this set
-    const needsWhiteRemoval = new Set(['candyFront', 'candyBack', 'witness', 'wanderer']);
+    // Every PNG under public/assets is produced by tools/build-assets.py and already
+    // ships a clean alpha channel, trimmed to the artwork. The engine used to run a
+    // full-image BFS flood-fill over five 1–3 MP images on every boot to strip white
+    // backgrounds; that work now happens once at build time instead of on every load.
+    this.loadSprite('candyFront', AssetPaths.characters.candyFront);
+    this.loadSprite('candyBack',  AssetPaths.characters.candyBack);
+    this.loadSprite('witness',    AssetPaths.npcs.witness);
+    this.loadSprite('scholar',    AssetPaths.npcs.scholar);
+    this.loadSprite('wanderer',   AssetPaths.npcs.wanderer);
+    this.loadSprite('detective',  AssetPaths.npcs.detective);
+    this.loadSprite('bench',      AssetPaths.props.bench);
 
-    const loadSprite = (key: string, src: string) => {
-      const img = new Image();
-      img.onload = () => {
-        if (needsWhiteRemoval.has(key)) {
-          this.sprites[key] = this.removeWhiteBg(img);
-        } else {
-          // Image already has transparency — copy to canvas directly
-          const ofc = document.createElement('canvas');
-          ofc.width = img.naturalWidth;
-          ofc.height = img.naturalHeight;
-          ofc.getContext('2d')!.drawImage(img, 0, 0);
-          this.sprites[key] = ofc;
-        }
-      };
-      img.src = src;
-      this.assets[key] = img;
-    };
-
-    loadSprite('candyFront', '/assets/characters/candy_front.png');
-    loadSprite('candyBack',  '/assets/characters/candy_back.png');
-    loadSprite('witness',    '/assets/npcs/witness.png');
-    loadSprite('scholar',    '/assets/npcs/scholar.png');
-    loadSprite('wanderer',   '/assets/npcs/wanderer.png');
-
-    // Background loaded as raw HTMLImageElement (drawn directly, not via sprites)
+    // Background is drawn straight from the <img>, not through the sprite cache.
     const bg = new Image();
-    bg.src = '/assets/backgrounds/courtyard.png';
+    bg.src = AssetPaths.backgrounds.courtyard;
     this.assets['courtyard'] = bg;
   }
 
-  private removeWhiteBg(img: HTMLImageElement, tolerance = 48): HTMLCanvasElement {
-    const ofc = document.createElement('canvas');
-    ofc.width = img.naturalWidth;
-    ofc.height = img.naturalHeight;
-    const ctx = ofc.getContext('2d')!;
-    ctx.drawImage(img, 0, 0);
-    const W = ofc.width, H = ofc.height;
-    const imageData = ctx.getImageData(0, 0, W, H);
-    const d = imageData.data;
-
-    // Sample background color from top-left corner pixel
-    const bgR = d[0], bgG = d[1], bgB = d[2];
-
-    // BFS flood-fill from all 4 corners to identify only background-connected pixels
-    const visited = new Uint8Array(W * H);
-    const queue: number[] = [];
-
-    const enqueue = (px: number) => {
-      if (px < 0 || px >= W * H || visited[px]) return;
-      const i = px * 4;
-      if (Math.abs(d[i] - bgR) <= tolerance &&
-          Math.abs(d[i+1] - bgG) <= tolerance &&
-          Math.abs(d[i+2] - bgB) <= tolerance) {
-        visited[px] = 1;
-        queue.push(px);
-      }
+  /**
+   * Load one PNG into the sprite cache. Assets are pre-cut by the build pipeline,
+   * so this is a straight copy onto a canvas — no background stripping at runtime.
+   */
+  private loadSprite(key: string, src: string) {
+    const img = new Image();
+    img.onload = () => {
+      const ofc = document.createElement('canvas');
+      ofc.width = img.naturalWidth;
+      ofc.height = img.naturalHeight;
+      ofc.getContext('2d')!.drawImage(img, 0, 0);
+      this.sprites[key] = ofc;
     };
+    img.onerror = () => console.warn(`[assets] failed to load ${src}`);
+    img.src = src;
+    this.assets[key] = img;
+  }
 
-    enqueue(0); enqueue(W - 1); enqueue((H - 1) * W); enqueue(H * W - 1);
-    while (queue.length > 0) {
-      const px = queue.pop()!;
-      const x = px % W, y = Math.floor(px / W);
-      if (x > 0) enqueue(px - 1);
-      if (x < W - 1) enqueue(px + 1);
-      if (y > 0) enqueue(px - W);
-      if (y < H - 1) enqueue(px + W);
+  /**
+   * Boss plate tinted with the current level's suit colour, built once per level.
+   * The tint is composited on an offscreen canvas so `source-atop` masks to the
+   * sprite itself rather than to everything already painted on the main canvas.
+   */
+  private getBossSprite(): HTMLCanvasElement | null {
+    const base = this.sprites['boss'];
+    if (!base) return null;
+    const tint = this.level?.bossConfig?.suitTint ?? '';
+    const key = `${this.level?.id}:${tint}:${base.width}x${base.height}`;
+    if (this.bossSpriteCanvas && this.bossSpriteKey === key) return this.bossSpriteCanvas;
+
+    const ofc = document.createElement('canvas');
+    ofc.width = base.width;
+    ofc.height = base.height;
+    const c = ofc.getContext('2d')!;
+    c.drawImage(base, 0, 0);
+    if (tint) {
+      c.globalCompositeOperation = 'source-atop';
+      c.globalAlpha = 0.34;
+      c.fillStyle = tint;
+      c.fillRect(0, 0, ofc.width, ofc.height);
+      c.globalCompositeOperation = 'source-over';
+      c.globalAlpha = 1;
     }
-
-    // Erase only background-connected pixels + feather the edge
-    for (let px = 0; px < W * H; px++) {
-      if (visited[px]) d[px * 4 + 3] = 0;
-    }
-
-    ctx.putImageData(imageData, 0, 0);
+    this.bossSpriteCanvas = ofc;
+    this.bossSpriteKey = key;
     return ofc;
   }
 
@@ -250,10 +262,153 @@ export class GameEngine {
     this.updateCamera(true);
     this.setGameState('exploring');
     this.level1BgCache = null;
+    // This level's boss plate; the tint cache is keyed on level id so it rebuilds.
+    this.bossSpriteCanvas = null;
+    this.staticLights = null; // rebuilt lazily once this level's plate is loaded
+    this.loadSprite('boss', bossSpriteFor(level.id));
     // Notify PixiGlow of new level data (if already attached)
     if (this.pixiGlow) {
       this.pixiGlow.setupLevel(this.tiles, level.id);
     }
+  }
+
+  /**
+   * Tell the engine the viewport size in LOGICAL pixels and the device-pixel
+   * ratio the canvas backing store was sized at. Rendering at device pixels is
+   * what stops the browser upscaling the art on a Retina screen or a phone;
+   * because the tilt transform also scales the canvas down, drawing at 2x and
+   * letting the compositor resolve it is effectively free supersampling.
+   */
+  setViewport(logicalW: number, logicalH: number, dpr: number) {
+    this.viewW = Math.max(1, logicalW);
+    this.viewH = Math.max(1, logicalH);
+    this.dpr = dpr;
+    this.lighting.resize(this.viewW, this.viewH);
+  }
+
+  setLightingQuality(q: LightingQuality) {
+    this.lighting.setQuality(q);
+  }
+
+  /**
+   * Lights that do not move for this level, in world space.
+   *
+   * Level 1 is painted rather than tiled, so its lights come from the plate:
+   * tools/bake-lights.py found the flames in the artwork and stored them as
+   * normalised plate coordinates, which we push through the same transform
+   * drawLevel1Scene() uses. That is what keeps a pool of light sitting on the
+   * candle that was painted for it rather than floating somewhere near it.
+   *
+   * Returns false while the plate is still loading, so it is retried.
+   */
+  private buildStaticLights(): boolean {
+    const S = TILE_SIZE;
+    const mapW = this.tiles[0].length * S;
+    const mapH = this.tiles.length * S;
+    const out: Light[] = [];
+    let seed = 0;
+
+    if (this.level.id === 1) {
+      const bg = this.assets['courtyard'];
+      if (!bg?.complete || !bg.naturalWidth) return false;
+      const drawH = mapW * (bg.naturalHeight / bg.naturalWidth);
+      const offY = Math.min(0, Math.max(mapH - drawH, 7 * S - COURTYARD_FOCAL_Y * drawH));
+      for (const L of COURTYARD_LIGHTS) {
+        out.push({
+          x: L.u * mapW,
+          y: offY + L.v * drawH,
+          radius: L.radius,
+          color: L.color,
+          intensity: L.intensity,
+          flicker: L.flicker,
+          seed: seed++ * 1.7,
+        });
+      }
+    } else {
+      // Tiled levels: candles are tile type 6 and are actually drawn there, so
+      // tile coordinates are the right source here.
+      let fx = 0, fy = 0, fn = 0;
+      for (let ty = 0; ty < this.tiles.length; ty++) {
+        for (let tx = 0; tx < this.tiles[ty].length; tx++) {
+          const tile = this.tiles[ty][tx];
+          if (tile === 6) {
+            out.push({
+              x: tx * S + S / 2, y: ty * S + S / 2,
+              radius: 155, color: [255, 188, 112],
+              intensity: 0.95, flicker: 0.34, seed: seed++ * 1.7,
+            });
+          } else if (tile === 3) {
+            fx += tx * S + S / 2; fy += ty * S + S / 2; fn++;
+          }
+        }
+      }
+      // One broad light at the centroid of the water tiles — the fountain.
+      if (fn > 0) {
+        out.push({
+          x: fx / fn, y: fy / fn,
+          radius: 300, color: [126, 168, 255],
+          intensity: 0.72, flicker: 0.07, seed: seed++ * 1.7,
+        });
+      }
+    }
+
+    this.staticLights = out;
+    return true;
+  }
+
+  /** Parse the rgb out of an `rgba(r,g,b,a)` string from the boss config. */
+  private static parseRgb(css: string, fallback: [number, number, number]): [number, number, number] {
+    const m = css.match(/(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+    return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : fallback;
+  }
+
+  /**
+   * Static lights plus everything that moves. Reuses one array so a full light
+   * set does not allocate 20 objects every frame.
+   */
+  private collectLights(): Light[] {
+    if (!this.staticLights) this.buildStaticLights();
+    const lights = this.frameLights;
+    lights.length = 0;
+    if (this.staticLights) for (const L of this.staticLights) lights.push(L);
+
+    // Candy carries a soft lamp of her own. Beyond looking right for a
+    // detective in a dark courtyard, it guarantees the ground she is standing
+    // on is readable wherever she walks — including the lower courtyard, which
+    // has no painted candles near it.
+    lights.push({
+      x: this.px, y: this.py + 6, radius: 235,
+      color: [156, 150, 214], intensity: 0.52, flicker: 0.04, seed: 11.3,
+    });
+
+    if (!this.hiddenClueCollected && this.level.hiddenCluePos) {
+      lights.push({
+        x: this.level.hiddenCluePos.x * TILE_SIZE + TILE_SIZE / 2,
+        y: this.level.hiddenCluePos.y * TILE_SIZE + TILE_SIZE / 2,
+        radius: 135, color: [255, 214, 120],
+        intensity: 0.62, flicker: 0.30, seed: 5.1,
+      });
+    }
+
+    if (this.gateOpen && this.level.gatePos) {
+      lights.push({
+        x: this.level.gatePos.x * TILE_SIZE + TILE_SIZE / 2,
+        y: this.level.gatePos.y * TILE_SIZE + TILE_SIZE / 2,
+        radius: 170, color: [186, 138, 255],
+        intensity: 0.50, flicker: 0.10, seed: 8.6,
+      });
+    }
+
+    if (this.bossActive && !this.bossDefeated) {
+      lights.push({
+        x: this.bossX, y: this.bossY, radius: 260,
+        color: GameEngine.parseRgb(this.level.bossConfig?.aura ?? '', [190, 90, 255]),
+        intensity: this.bossFlash > 0 ? 1 : 0.82,
+        flicker: 0.22, seed: 2.9,
+      });
+    }
+
+    return lights;
   }
 
   private bindKeys() {
@@ -319,9 +474,18 @@ export class GameEngine {
     this.animId = requestAnimationFrame(this.loop);
     const dt = Math.min((now - this.lastTime) / 16.667, 3);
     this.lastTime = now;
-    this.time++;
+    // `time` advances by dt, not by 1. It used to be a frame counter, which made
+    // every animation driven off it — the walk bob, candle flicker, boss orbit,
+    // fountain — run at the monitor's refresh rate. On a 144 Hz screen Candy's
+    // legs pumped 2.4x faster than on a 60 Hz one. dt is normalised to 60 fps
+    // units, so `time` now advances 60 per second on any display and every
+    // multiplier tuned against the old counter stays correct.
+    this.time += dt;
+    const t0 = performance.now();
     this.update(dt);
     this.render();
+    this.frameMs += (performance.now() - t0 - this.frameMs) * 0.1;
+    this.fps += ((dt > 0 ? 60 / dt : 60) - this.fps) * 0.05;
     this.prevKeys = { ...this.keys };
     this.prevMobile = { ...this.mobileInput };
   };
@@ -472,6 +636,24 @@ export class GameEngine {
     return tile === 1 || tile === 2 || tile === 3;
   }
 
+  /**
+   * Is this NPC close enough, and is Candy facing the right way, to talk?
+   *
+   * Both the interact key and the on-screen highlight go through this, so the
+   * glow can never promise a conversation the key press will not deliver. The
+   * reach box is offset in the direction Candy faces — you talk to who you are
+   * looking at, not whoever happens to be nearest.
+   */
+  private isNpcInReach(nx: number, ny: number): boolean {
+    const range = INTERACT_RANGE;
+    let dx = 0, dy = 0;
+    if (this.facing === 'up') dy = -range;
+    else if (this.facing === 'down') dy = range;
+    else if (this.facing === 'left') dx = -range;
+    else dx = range;
+    return Math.abs(this.px + dx - nx) < 48 && Math.abs(this.py + dy - ny) < 48;
+  }
+
   private checkInteract() {
     const range = INTERACT_RANGE;
     let dx = 0, dy = 0;
@@ -488,7 +670,7 @@ export class GameEngine {
       const npc = this.level.npcs[i];
       const nx = npc.x * TILE_SIZE + TILE_SIZE / 2;
       const ny = npc.y * TILE_SIZE + TILE_SIZE / 2;
-      if (Math.abs(checkX - nx) < 48 && Math.abs(checkY - ny) < 48) {
+      if (this.isNpcInReach(nx, ny)) {
         this.startDialogue(npc, i);
         return;
       }
@@ -513,7 +695,11 @@ export class GameEngine {
   }
 
   private startDialogue(npc: NPCData, index: number) {
-    this.dialogueLines = npc.dialogue;
+    // Tag every line with the portrait for this NPC's slot so the dialogue UI
+    // shows matching art on all 20 levels, not just where the NPC happens to be
+    // named "Witness" / "Scholar" / "Wanderer".
+    const portrait = portraitFor(npc.name, npcSpriteKey(this.level.id, index));
+    this.dialogueLines = npc.dialogue.map(l => (l.portrait ? l : { ...l, portrait: portrait ?? undefined }));
     this.dialogueIndex = 0;
     this.pendingClueId = null;
 
@@ -832,8 +1018,8 @@ export class GameEngine {
 
   private updateCamera(snap: boolean) {
     const z = this.cameraZoom;
-    const vpW = this.canvas.width / z;
-    const vpH = this.canvas.height / z;
+    const vpW = this.viewW / z;
+    const vpH = this.viewH / z;
     const targetX = this.px - vpW / 2;
     const targetY = this.py - vpH / 2;
     const mapW = this.tiles[0].length * TILE_SIZE;
@@ -893,8 +1079,8 @@ export class GameEngine {
     // Spawn a slow-drifting purple mote in the visible viewport area
     const vx = (Math.random() - 0.5) * 0.6;
     const vy = -(Math.random() * 0.8 + 0.3);
-    const spawnX = this.camX + Math.random() * (this.canvas.width / this.cameraZoom);
-    const spawnY = this.camY + Math.random() * (this.canvas.height / this.cameraZoom);
+    const spawnX = this.camX + Math.random() * (this.viewW / this.cameraZoom);
+    const spawnY = this.camY + Math.random() * (this.viewH / this.cameraZoom);
     const hue = 260 + Math.floor(Math.random() * 60);
     this.particles.push({
       x: spawnX, y: spawnY,
@@ -922,9 +1108,12 @@ export class GameEngine {
 
   private render() {
     const ctx = this.ctx;
-    const W = this.canvas.width;
-    const H = this.canvas.height;
+    const W = this.viewW;
+    const H = this.viewH;
 
+    // The one place the device-pixel scale is applied. Everything below this
+    // line works in logical pixels, so no other code has to know about DPR.
+    ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = this.level.levelTheme.bg;
     ctx.fillRect(0, 0, W, H);
@@ -948,11 +1137,21 @@ export class GameEngine {
 
     ctx.restore();
 
-    // ── POST-PROCESS ATMOSPHERE ──────────────────────────────────────────────
+    // ── LIGHTING ─────────────────────────────────────────────────────────────
+    // Multiply the finished scene by the accumulated light buffer, then bloom
+    // the lights and lift the blacks. This replaces the flat 10% purple wash
+    // that used to stand in for atmosphere: that darkened every pixel equally,
+    // which is why the courtyard read at one exposure everywhere.
+    this.lighting.render(
+      ctx,
+      this.collectLights(),
+      this.ambient,
+      { x: this.camX - this.shakeX, y: this.camY - this.shakeY, zoom: this.cameraZoom },
+      this.time,
+    );
+    this.lighting.grade(ctx, W, H, [64, 54, 92], 0.055);
 
-    // 1. Subtle ambient purple lift — keep dark fantasy mood but allow midtones to read
-    ctx.fillStyle = 'rgba(18,8,36,0.10)';
-    ctx.fillRect(0, 0, W, H);
+    // ── POST-PROCESS ATMOSPHERE ──────────────────────────────────────────────
 
     // 2. Edge fog — narrow bands only so center of map stays visible
     const fogT = ctx.createLinearGradient(0, 0, 0, H * 0.18);
@@ -979,22 +1178,17 @@ export class GameEngine {
     ctx.fillStyle = fogR;
     ctx.fillRect(W * 0.90, 0, W * 0.10, H);
 
-    // 3. Subtle purple bloom at fountain center — kept low to avoid wash
-    const fxScreen = W / 2;
-    const fyScreen = H * 0.38;
-    const bloom = ctx.createRadialGradient(fxScreen, fyScreen, 10, fxScreen, fyScreen, H * 0.32);
-    bloom.addColorStop(0, `rgba(80,30,150,${0.035 + Math.sin(this.time * 0.04) * 0.012})`);
-    bloom.addColorStop(0.5, `rgba(50,10,90,${0.015})`);
-    bloom.addColorStop(1, 'rgba(30,0,60,0)');
-    ctx.fillStyle = bloom;
-    ctx.fillRect(0, 0, W, H);
+    // 3. The fountain used to get a hand-painted screen-space bloom pinned to a
+    //    fixed point on screen, which slid off the fountain as the camera moved.
+    //    It is a real world-space light now, so this is gone.
 
-    // 4. Vignette — gentle fade, center stays fully lit
+    // 4. Vignette — softer than before, because the light falloff now does most
+    //    of this work in world space instead of as a fixed screen overlay
     const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.28, W / 2, H / 2, H * 0.82);
     vg.addColorStop(0, 'rgba(0,0,0,0)');
-    vg.addColorStop(0.60, 'rgba(0,0,0,0.06)');
-    vg.addColorStop(0.82, 'rgba(0,0,0,0.28)');
-    vg.addColorStop(1,    'rgba(0,0,0,0.52)');
+    vg.addColorStop(0.60, 'rgba(0,0,0,0.04)');
+    vg.addColorStop(0.82, 'rgba(0,0,0,0.18)');
+    vg.addColorStop(1,    'rgba(0,0,0,0.38)');
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, W, H);
 
@@ -1024,6 +1218,10 @@ export class GameEngine {
       const tileY = Math.floor(this.py / TILE_SIZE);
       const tile = (this.tiles[tileY]?.[tileX] ?? -1);
       const lines = [
+        `FPS  ${this.fps.toFixed(0)}   frame ${this.frameMs.toFixed(2)} ms   dpr ${this.dpr}`,
+        `VIEW ${this.viewW}x${this.viewH} logical  ->  ${this.canvas.width}x${this.canvas.height} device`,
+        `LIGHTS  ${this.lighting.lastDrawnCount} drawn / ${this.lighting.lastLightCount} total`,
+        `PARTICLES  ${this.particles.length}`,
         `POS  world:(${Math.round(this.px)}, ${Math.round(this.py)})  tile:(${tileX}, ${tileY})`,
         `FACING   ${this.facing}   MOVING ${this.moving}`,
         `GATE   ${this.gateOpen ? 'OPEN ✓' : 'CLOSED ✗'}   TILE at pos: ${tile}`,
@@ -1034,11 +1232,11 @@ export class GameEngine {
       ];
       ctx.save();
       ctx.fillStyle = 'rgba(0,0,0,0.72)';
-      ctx.fillRect(8, 8, 360, lines.length * 18 + 12);
+      ctx.fillRect(8, 8, 400, lines.length * 18 + 12);
       ctx.font = '12px monospace';
       ctx.textBaseline = 'top';
       lines.forEach((line, i) => {
-        ctx.fillStyle = i === 2 ? (this.gateOpen ? '#88ff88' : '#ff8888') : '#e8e8ff';
+        ctx.fillStyle = i < 3 ? '#9ee8b0' : i === 6 ? (this.gateOpen ? '#88ff88' : '#ff8888') : '#e8e8ff';
         ctx.fillText(line, 14, 14 + i * 18);
       });
       ctx.restore();
@@ -1058,9 +1256,15 @@ export class GameEngine {
     // ── Courtyard background PNG ─────────────────────────────────────────
     const bgImg = this.assets['courtyard'];
     if (bgImg?.complete && bgImg.naturalWidth > 0) {
-      // Scale PNG to cover map width; image is portrait so it extends below — that's fine
+      // The plate is portrait and the map is landscape, so it can only cover the
+      // map width. Pinned to the top it showed the arch and cut everything below
+      // the fountain off the map — which is why the lower courtyard read as empty.
+      // Anchor it on the painted fountain instead, so that fountain lands on the
+      // fountain tile the animated overlays are drawn at and the benches, signs
+      // and lower cobblestone all fall inside the playable area.
       const drawH = mapW * (bgImg.naturalHeight / bgImg.naturalWidth);
-      ctx.drawImage(bgImg, 0, 0, mapW, drawH);
+      const offY = Math.min(0, Math.max(mapH - drawH, fcy - COURTYARD_FOCAL_Y * drawH));
+      ctx.drawImage(bgImg, 0, offY, mapW, drawH);
     } else {
       // Fallback: code-drawn static background while PNG loads
       if (!this.level1BgCache) {
@@ -1710,9 +1914,9 @@ export class GameEngine {
     const rows = this.tiles.length;
     const cols = this.tiles[0].length;
     const startRow = Math.floor(this.camY / TILE_SIZE) - 1;
-    const endRow = Math.ceil((this.camY + this.canvas.height) / TILE_SIZE) + 1;
+    const endRow = Math.ceil((this.camY + this.viewH / this.cameraZoom) / TILE_SIZE) + 1;
     const startCol = Math.floor(this.camX / TILE_SIZE) - 1;
-    const endCol = Math.ceil((this.camX + this.canvas.width) / TILE_SIZE) + 1;
+    const endCol = Math.ceil((this.camX + this.viewW / this.cameraZoom) / TILE_SIZE) + 1;
 
     for (let row = Math.max(0, startRow); row < Math.min(rows, endRow); row++) {
       for (let col = Math.max(0, startCol); col < Math.min(cols, endCol); col++) {
@@ -2043,18 +2247,45 @@ export class GameEngine {
       ctx.ellipse(x, y + 16, 16, 5, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // PNG sprite lookup: 0=Witness, 1=Scholar, 2+=Wanderer/Guard
-      const sprKey = i === 0 ? 'witness' : i === 1 ? 'scholar' : 'wanderer';
+      const sprKey = npcSpriteKey(this.level.id, i);
       const spr = this.sprites[sprKey];
       const bobY = Math.sin(this.time * 0.07 + i * 1.2) * 2;
+
+      // Can Candy talk to this one right now? Everything below keys off this, so
+      // the highlight is a promise the interact key actually keeps.
+      const inReach = this.isNpcInReach(x, y);
+
+      // Standing ring on the ground when in reach — reads at a glance without
+      // covering the character, and sits in world space so it tracks properly
+      // under the tilt rather than floating like a screen-space marker.
+      if (inReach) {
+        const pulse = 0.5 + Math.sin(this.time * 0.14) * 0.5;
+        ctx.save();
+        ctx.strokeStyle = `rgba(255,214,140,${0.32 + pulse * 0.34})`;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.ellipse(x, y + 16, 22 + pulse * 3, 8 + pulse * 1.5, 0, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
 
       if (spr) {
         const h = 84;
         const w = h * (spr.width / spr.height);
+        // Turn to face Candy. There is only a front-facing plate per NPC, so
+        // mirroring is the whole trick — but it is enough to stop everyone
+        // staring rigidly past her.
+        const faceLeft = this.px < x - 6;
         ctx.save();
         ctx.translate(x, y + 16 + bobY);
-        ctx.shadowColor = 'rgba(0,0,0,0.85)';
-        ctx.shadowBlur = 6;
+        ctx.scale(faceLeft ? -1 : 1, 1);
+        if (inReach) {
+          ctx.shadowColor = 'rgba(255,206,120,0.9)';
+          ctx.shadowBlur = 14;
+        } else {
+          ctx.shadowColor = 'rgba(0,0,0,0.85)';
+          ctx.shadowBlur = 6;
+        }
         ctx.drawImage(spr, -w / 2, -h, w, h);
         ctx.shadowBlur = 0;
         ctx.shadowColor = 'transparent';
@@ -2075,13 +2306,14 @@ export class GameEngine {
       // Interact indicator
       if (!interacted) {
         const bobY = Math.sin(this.time * 0.1) * 3;
-        // Speech bubble
-        ctx.fillStyle = 'rgba(240,235,255,0.97)';
+        // In reach the bubble turns gold and names the key; out of reach it stays
+        // the quiet "this one has something to say" marker it was.
+        ctx.fillStyle = inReach ? 'rgba(255,236,190,0.98)' : 'rgba(240,235,255,0.97)';
         ctx.beginPath();
         (ctx as any).roundRect(x - 17, y - 62 + bobY, 34, 19, 5);
         ctx.fill();
-        ctx.strokeStyle = 'rgba(180,140,255,0.5)';
-        ctx.lineWidth = 1;
+        ctx.strokeStyle = inReach ? 'rgba(255,196,90,0.95)' : 'rgba(180,140,255,0.5)';
+        ctx.lineWidth = inReach ? 1.6 : 1;
         ctx.stroke();
         // Bubble tail
         ctx.fillStyle = 'rgba(240,235,255,0.97)';
@@ -2090,12 +2322,23 @@ export class GameEngine {
         ctx.lineTo(x + 2, y - 38 + bobY);
         ctx.lineTo(x + 7, y - 44 + bobY);
         ctx.fill();
-        // Dots
-        ctx.fillStyle = '#6644AA';
-        for (let d = 0; d < 3; d++) {
-          ctx.beginPath();
-          ctx.arc(x - 6 + d * 6, y - 52 + bobY, 2.5, 0, Math.PI * 2);
-          ctx.fill();
+        if (inReach) {
+          // Name the key rather than drawing an abstract glyph — it is the same
+          // key on the keyboard and the on-screen INTERACT button.
+          ctx.fillStyle = '#5A3A00';
+          ctx.font = 'bold 11px monospace';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText('E', x, y - 52 + bobY);
+          ctx.textBaseline = 'alphabetic';
+        } else {
+          // Dots
+          ctx.fillStyle = '#6644AA';
+          for (let d = 0; d < 3; d++) {
+            ctx.beginPath();
+            ctx.arc(x - 6 + d * 6, y - 52 + bobY, 2.5, 0, Math.PI * 2);
+            ctx.fill();
+          }
         }
       } else {
         // Checkmark badge
@@ -2543,16 +2786,22 @@ export class GameEngine {
       ctx.ellipse(mx, my + 16, shadowW, shadowH, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // For left/right: squeeze the sprite horizontally to fake a side-profile view.
-      // scaleX = 0.38 gives a slim silhouette that reads as "turning sideways".
-      // For up/down: normal full-width render.
+      // No side-facing art exists for Candy, so left/right is faked by narrowing
+      // the front sprite into a three-quarter turn. 0.62 still reads as a person;
+      // the old 0.38 flattened her into a sliver. The mirror plus an opposite lean
+      // and a small weight shift is what makes left and right tell apart.
       const isSideways = this.facing === 'left' || this.facing === 'right';
-      const scaleX = isSideways ? (facingLeft ? -0.38 : 0.38) : (facingLeft ? -1 : 1);
+      const dir = facingLeft ? -1 : 1;
+      const scaleX = isSideways ? dir * 0.62 : 1;
+      const leanRad = isSideways ? dir * 0.06 : 0;
+      const leadX   = isSideways ? dir * 3 : 0;
 
       ctx.save();
-      ctx.translate(mx + swayX, my + 16 + bobY);
+      ctx.translate(mx + swayX + leadX, my + 16 + bobY);
+      // Rotate before scale so the lean stays in world space and does not flip
+      // direction along with the mirrored sprite.
+      ctx.rotate(tiltRad * dir + leanRad);
       ctx.scale(scaleX, 1);
-      ctx.rotate(tiltRad);
       ctx.shadowColor = 'rgba(0,0,0,0.85)';
       ctx.shadowBlur = 5;
       ctx.drawImage(spr, -w / 2, -h, w, h);
@@ -2880,29 +3129,42 @@ export class GameEngine {
       ctx.fill();
     }
 
-    // Boss body
-    const bodyColor = this.bossDead ? '#FF4444' : (flashing ? '#FFFFFF' : '#4A0080');
-    ctx.fillStyle = bodyColor;
+    // Boss body — the level's boss plate, tinted with its suit colour.
+    // Falls back to the original orb only while the art is still loading.
     const bodyPulse = Math.sin(this.time * 0.1) * 3;
-    ctx.beginPath();
-    ctx.arc(x, y, 28 + bodyPulse, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Core
-    ctx.fillStyle = flashing ? '#FF8800' : '#7B2FBE';
-    ctx.beginPath();
-    ctx.arc(x, y, 16, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Eye
-    ctx.fillStyle = '#FF0000';
-    ctx.beginPath();
-    ctx.arc(x, y, 8, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#FFFFFF';
-    ctx.beginPath();
-    ctx.arc(x - 2, y - 2, 3, 0, Math.PI * 2);
-    ctx.fill();
+    const bossSpr = this.getBossSprite();
+    if (bossSpr) {
+      const bh = 138 + bodyPulse;
+      const bw = bh * (bossSpr.width / bossSpr.height);
+      ctx.save();
+      if (this.bossDead) ctx.globalAlpha = Math.max(0, 1 - this.bossDeathTimer / 130);
+      if (flashing) ctx.filter = 'brightness(2.4) saturate(0.35)';
+      ctx.shadowColor = bossAura;
+      ctx.shadowBlur = 16;
+      ctx.drawImage(bossSpr, x - bw / 2, y + 26 - bh, bw, bh);
+      ctx.shadowBlur = 0;
+      ctx.shadowColor = 'transparent';
+      ctx.filter = 'none';
+      ctx.restore();
+    } else {
+      const bodyColor = this.bossDead ? '#FF4444' : (flashing ? '#FFFFFF' : '#4A0080');
+      ctx.fillStyle = bodyColor;
+      ctx.beginPath();
+      ctx.arc(x, y, 28 + bodyPulse, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = flashing ? '#FF8800' : '#7B2FBE';
+      ctx.beginPath();
+      ctx.arc(x, y, 16, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#FF0000';
+      ctx.beginPath();
+      ctx.arc(x, y, 8, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#FFFFFF';
+      ctx.beginPath();
+      ctx.arc(x - 2, y - 2, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
     // Name tag
     if (!this.bossDead) {
@@ -3056,6 +3318,23 @@ export class GameEngine {
   }
 
   private drawBench(ctx: CanvasRenderingContext2D, x: number, y: number) {
+    // Painted bench where the art has loaded. Level 1 does not come through here —
+    // its benches are already in the courtyard plate — so this only dresses 2-20.
+    const spr = this.sprites['bench'];
+    if (spr) {
+      const bw = 58;
+      const bh = bw * (spr.height / spr.width);
+      ctx.save();
+      ctx.fillStyle = 'rgba(0,0,0,0.30)';
+      ctx.beginPath();
+      ctx.ellipse(x, y + 10, bw * 0.44, 5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.drawImage(spr, x - bw / 2, y + 10 - bh, bw, bh);
+      ctx.restore();
+      return;
+    }
+
+    // Fallback: code-drawn bench
     // Back rest (top, since top-down)
     ctx.fillStyle = '#3D2B1F';
     ctx.fillRect(x - 24, y - 20, 48, 8);

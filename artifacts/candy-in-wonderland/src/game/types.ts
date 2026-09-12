@@ -36,6 +36,13 @@ export interface DialogueLine {
   text: string;
   category?: ClueCategory;
   clueId?: string;
+  /**
+   * Portrait resolved by the engine when the dialogue starts. The engine knows
+   * which NPC slot is speaking; the dialogue UI only knows a name, and NPC names
+   * differ on every level, so resolving it here is what gives all 20 levels real
+   * portrait art instead of the procedural fallback.
+   */
+  portrait?: string;
 }
 
 export interface NPCData {

@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { GameEngine } from '../game/GameEngine';
-import { PixiGlow }   from '../game/PixiGlow';
+import { QUALITY } from '../game/Lighting';
 import { AudioManager } from '../game/AudioManager';
 import type { GameCallbacks } from '../game/GameEngine';
 import type { LevelData } from '../game/types';
@@ -24,31 +24,49 @@ export function GameCanvas({ level, audio, callbacks, engineRef }: GameCanvasPro
     const W = host.clientWidth;
     const H = host.clientHeight;
 
+    /**
+     * Device-pixel ratio, clamped. The canvas used to be sized in CSS pixels,
+     * so on any Retina screen or phone the browser upscaled the finished frame
+     * and softened every edge. Rendering at device pixels fixes that; the clamp
+     * is the standard trade — a 3x phone renders 9x the pixels of a 1x one for
+     * a difference nobody can see, and it is the single biggest thing you can
+     * do to a mobile frame budget.
+     */
+    const pickDpr = () => Math.min(window.devicePixelRatio || 1, 2);
+
     // ── Canvas 2D — game logic + base rendering ─────────────────────────
     const canvas = document.createElement('canvas');
-    canvas.width  = W;
-    canvas.height = H;
+    let dpr = pickDpr();
+    canvas.width  = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
     canvas.style.cssText = `
       position:absolute; inset:0;
       width:100%; height:100%;
-      image-rendering:pixelated;
+      image-rendering:auto;
       cursor:crosshair;
       z-index:10;
     `;
     perf.appendChild(canvas);
 
-    // ── PixiJS — WebGL glow / atmosphere overlay ────────────────────────
-    let pixi: PixiGlow | null = null;
-    try {
-      pixi = new PixiGlow(perf, W, H);
-    } catch (e) {
-      console.warn('[PixiGlow] WebGL unavailable, running without glow layer:', e);
-    }
-
     // ── Game engine ─────────────────────────────────────────────────────
     const engine = new GameEngine(canvas, audio, callbacks);
-    if (pixi) engine.setPixiGlow(pixi);
     engineRef.current = engine;
+    engine.setViewport(W, H, dpr);
+
+    /**
+     * Lighting quality. The buffer resolution and bloom radius are the two
+     * knobs that actually cost anything, so they scale with the device rather
+     * than being tuned against a desktop and left there.
+     */
+    const coarse = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+    engine.setLightingQuality(coarse ? QUALITY.medium : QUALITY.high);
+
+    // PixiGlow is deliberately not attached any more. It was an additive-only
+    // layer — it could brighten a candle but nothing in the scene ever went
+    // dark — and it composited on a canvas ABOVE this one, so it would wash out
+    // the multiply pass the new lighting depends on. Lighting.ts owns both
+    // halves now. The module is still in the tree; re-attaching it would double
+    // every light source.
     engine.loadLevel(level);
     engine.start();
 
@@ -56,9 +74,10 @@ export function GameCanvas({ level, audio, callbacks, engineRef }: GameCanvasPro
     const resize = () => {
       const nW = host.clientWidth;
       const nH = host.clientHeight;
-      canvas.width  = nW;
-      canvas.height = nH;
-      pixi?.resize(nW, nH);
+      dpr = pickDpr();
+      canvas.width  = Math.round(nW * dpr);
+      canvas.height = Math.round(nH * dpr);
+      engine.setViewport(nW, nH, dpr);
     };
 
     const ro = new ResizeObserver(resize);
@@ -72,8 +91,6 @@ export function GameCanvas({ level, audio, callbacks, engineRef }: GameCanvasPro
     return () => {
       engine.stop();
       engine.unbindKeys();
-      engine.setPixiGlow(null);
-      pixi?.destroy();
       if (perf.contains(canvas)) perf.removeChild(canvas);
       ro.disconnect();
       window.removeEventListener('resize', resize);
